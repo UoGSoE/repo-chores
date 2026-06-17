@@ -89,12 +89,16 @@ python3 repo-chores.py report
 
 - `--path PATH`: folder to scan (overrides `REPO_CHORES_CODE_DIR`)
 - `--only SUBSTRING`: only process apps whose directory name contains this, which is handy for testing
-- `--format {text,csv,json}`: output format (default `text`); `csv` and `json` go to stdout for piping into a spreadsheet or `jq`
+- `--format {text,csv,json,html}`: output format (default `text`); `csv` and `json` go to stdout for piping into a spreadsheet or `jq`, and `html` is a single self-contained page for skimming in a browser (see [The HTML report](#the-html-report))
+- `--css FILE`: (`--format html` only) use your own stylesheet instead of the built-in theme
 - `--apply`: (`update-descriptions` only) write the changes; without it you get a dry-run
 
 ```bash
 # Whole estate, as a spreadsheet
 uv run repo-chores.py report --format csv > repos.csv
+
+# A visual drift report you can open in a browser
+uv run repo-chores.py report --format html > report.html && open report.html
 
 # See what description changes would be made, without making them
 uv run repo-chores.py update-descriptions
@@ -102,6 +106,39 @@ uv run repo-chores.py update-descriptions
 # Apply them to a single app first, to check
 uv run repo-chores.py update-descriptions --only my-app --apply
 ```
+
+## The HTML report
+
+`--format html` writes a single, self-contained HTML page to stdout — inline
+CSS, no external assets or CDN calls — so it opens straight from disk and works
+offline:
+
+```bash
+uv run repo-chores.py report --format html > report.html && open report.html
+```
+
+It groups each app's GitLab and GitHub remotes together so cross-platform drift
+is obvious, and highlights problems rather than just listing them: description
+prefix mismatches, boilerplate/missing READMEs, version drift (where the GitLab
+and GitHub Laravel majors disagree), and unreachable remotes. A summary header
+counts the issues and links straight to the apps that need attention. The other
+commands (`readme-check`, `update-descriptions`) accept `--format html` too.
+
+### Theming
+
+The default look uses the University of Glasgow house style (University blue,
+Noto Sans with a system-font fallback so nothing is fetched from a font CDN).
+Re-theme it either way you prefer:
+
+- edit the `DEFAULT_HTML_STYLE` block near the top of `repo-chores.py`, or
+- keep the script untouched and point at your own stylesheet:
+
+```bash
+uv run repo-chores.py report --format html --css mytheme.css > report.html
+```
+
+`--css` replaces the whole `<style>` block with the contents of your file, so
+the page stays self-contained.
 
 ## The description convention
 

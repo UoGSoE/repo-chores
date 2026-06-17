@@ -28,6 +28,7 @@ Configuration — via environment variables, or a .env file in this directory
 
 Usage — run with uv, or plain `python3 repo-chores.py ...`:
     uv run repo-chores.py report
+    uv run repo-chores.py report --format html > report.html   # visual report
     uv run repo-chores.py readme-check
     uv run repo-chores.py update-descriptions            # dry-run
     uv run repo-chores.py update-descriptions --apply     # actually writes
@@ -37,12 +38,14 @@ from __future__ import annotations
 
 import argparse
 import csv
+import html
 import json
 import os
 import re
 import subprocess
 import sys
 import urllib.parse
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -400,6 +403,331 @@ def report_row(app: App, info: RemoteInfo) -> dict:
     }
 
 
+# --- HTML output (customise the look here) ------------------------------------
+# `--format html` renders a single, self-contained page: the <style> block below
+# is inlined into it, so there are NO external assets or CDN calls. It opens
+# straight from disk (`... --format html > report.html && open report.html`) and
+# works offline — handy when the VPN is up for the GitLab host but little else.
+#
+# Re-theme it in one of two ways:
+#   * edit DEFAULT_HTML_STYLE right here, or
+#   * leave the script pristine and pass your own stylesheet: `--css mytheme.css`.
+#
+# The default palette is the University of Glasgow house style
+# (https://design.gla.ac.uk): University blue #011451, dark blue #005398,
+# error #D4351C, success #8BC34A, highlight #FFDD00. Noto Sans is the UofG
+# typeface — we list it first and fall back to the system sans stack rather than
+# fetching it from a font CDN (which would break the "self-contained" promise).
+
+DEFAULT_HTML_STYLE = """
+:root {
+  --ug-blue: #011451; --ug-dark-blue: #005398;
+  --error: #D4351C; --success: #8BC34A; --highlight: #FFDD00;
+  --ink: #323232; --grey-1: #f5f5f5; --grey-2: #e6e6e6;
+  --warn-bg: #fff8d6; --warn-ink: #6b5500;
+  --bad-bg: #fbe4e0; --bad-ink: #8f1c0c;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--grey-1); color: var(--ink); line-height: 1.5;
+  font-family: "Noto Sans", system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+main { max-width: 1100px; margin: 0 auto; padding: 24px; }
+h1 { color: var(--ug-blue); font-size: 1.6rem; margin: 0 0 4px; }
+.lead { color: #555; margin: 0 0 24px; }
+a { color: var(--ug-dark-blue); }
+
+.summary { display: flex; flex-wrap: wrap; gap: 12px; margin: 0 0 16px; }
+.stat { background: #fff; border: 1px solid var(--grey-2); border-radius: 6px; padding: 8px 14px; font-size: .9rem; }
+.stat b { color: var(--ug-blue); font-size: 1.1rem; }
+.stat.warn { border-color: var(--highlight); background: var(--warn-bg); }
+.stat.warn b { color: var(--warn-ink); }
+.stat.bad { border-color: var(--error); background: var(--bad-bg); }
+.stat.bad b { color: var(--bad-ink); }
+.stat.ok b { color: #3c6e00; }
+
+.problem-list { margin: 0 0 24px; font-size: .9rem; }
+.problem-list a { margin-right: 12px; white-space: nowrap; }
+
+.app { background: #fff; border: 1px solid var(--grey-2); border-radius: 8px; margin: 16px 0; overflow: hidden; }
+.app.flagged { border-left: 6px solid var(--highlight); }
+.app.drift { border-left: 6px solid var(--error); }
+.app > header { background: var(--ug-blue); color: #fff; padding: 12px 16px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.app > header h2 { font-size: 1.05rem; margin: 0; font-weight: 600; }
+
+.badge { font-size: .72rem; font-weight: 700; text-transform: uppercase; letter-spacing: .03em; padding: 2px 8px; border-radius: 999px; }
+.badge.warn { background: var(--highlight); color: #3a2f00; }
+.badge.bad { background: var(--error); color: #fff; }
+.badge.ok { background: var(--success); color: #1f3300; }
+
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 8px 16px; vertical-align: top; border-top: 1px solid var(--grey-2); }
+thead th { border-top: none; font-size: .72rem; text-transform: uppercase; letter-spacing: .03em; color: #666; background: var(--grey-1); }
+tbody tr:hover { background: #fafbff; }
+.platform { font-weight: 600; color: var(--ug-dark-blue); white-space: nowrap; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .85rem; }
+.muted { color: #999; }
+.desc { white-space: pre-wrap; word-break: break-word; max-width: 40ch; font-size: .85rem; }
+
+td.flag-warn { background: var(--warn-bg); color: var(--warn-ink); font-weight: 600; }
+td.flag-bad { background: var(--bad-bg); color: var(--bad-ink); font-weight: 600; }
+tr.unreachable td { background: var(--bad-bg); color: var(--bad-ink); }
+
+footer.meta { margin-top: 32px; color: #999; font-size: .8rem; border-top: 1px solid var(--grey-2); padding-top: 12px; }
+"""
+
+# The page shell. Only the named {placeholders} are substituted; str.format does
+# not re-scan the substituted values, so the CSS braces in {style} and any stray
+# braces in descriptions are safe to insert as-is.
+HTML_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{title}</title>
+<style>
+{style}
+</style>
+</head>
+<body>
+<main>
+<h1>{heading}</h1>
+<p class="lead">{lead}</p>
+{summary}
+{body}
+<footer class="meta">{footer}</footer>
+</main>
+</body>
+</html>
+"""
+
+
+def load_html_style(args: argparse.Namespace) -> str:
+    """CSS for --format html: a user file via --css, else the built-in UofG theme."""
+    css_path = getattr(args, "css", None)
+    if css_path:
+        path = Path(css_path).expanduser()
+        if not path.is_file():
+            sys.exit(f"--css stylesheet not found: {path}")
+        return path.read_text(encoding="utf-8")
+    return DEFAULT_HTML_STYLE
+
+
+def _slug(name: str) -> str:
+    """A safe #anchor id from an app directory name."""
+    return re.sub(r"[^A-Za-z0-9_-]+", "-", name).strip("-") or "app"
+
+
+def _remote_label(platform: str) -> str:
+    return {"gitlab": "GitLab", "github": "GitHub"}.get(platform, html.escape(platform or "?"))
+
+
+def _stat(value: object, label: str, *, tone: str = "") -> str:
+    """A summary chip. `value` must be an int or already-escaped string."""
+    cls = f"stat {tone}".strip()
+    return f"<span class='{cls}'><b>{value}</b> {html.escape(label)}</span>"
+
+
+def render_html_page(*, title: str, heading: str, lead: str,
+                     summary: str, body: str, style: str) -> str:
+    """Wrap pre-built summary/body HTML in the page shell.
+
+    title/heading/lead are escaped here; summary/body are trusted HTML that the
+    callers below assemble with html.escape() on every dynamic value, and style
+    is the CSS (the built-in default or a user's --css file).
+    """
+    footer = f"repo-chores · generated {datetime.now():%Y-%m-%d %H:%M}"
+    return HTML_PAGE.format(
+        title=html.escape(title), heading=html.escape(heading),
+        lead=html.escape(lead), summary=summary, body=body,
+        style=style, footer=html.escape(footer),
+    )
+
+
+def render_remote_row(r: dict, drift: bool) -> str:
+    """One <tr> for a single remote within an app's table."""
+    label = _remote_label(r.get("platform", ""))
+    path = html.escape(r.get("path", ""))
+    if r.get("reachable") == "N":
+        err = html.escape(r.get("error") or "unreachable")
+        return (f"<tr class='unreachable'><td class='platform'>{label}</td>"
+                f"<td class='mono'>{path}</td>"
+                f"<td colspan='5'>⚠ unreachable — {err}</td></tr>")
+
+    platform = r.get("platform", "")
+    laravel = r.get("laravel", "")
+    laravel_cell_cls = " class='flag-bad'" if drift and laravel else ""
+    laravel_html = html.escape(laravel) if laravel else "<span class='muted'>unknown</span>"
+
+    prefix_ok = r.get("prefix_ok", "?")
+    if prefix_ok == "Y":
+        prefix_cell = "<td><span class='badge ok'>ok</span></td>"
+    elif prefix_ok == "N":
+        expected = expected_prefix(laravel, platform) or ""
+        prefix_cell = (f"<td class='flag-warn'>mismatch"
+                       f"<br><span class='muted'>expected {html.escape(expected)}</span></td>")
+    else:
+        prefix_cell = "<td><span class='muted'>n/a</span></td>"
+
+    readme_cell = ("<td>custom</td>" if r.get("custom_readme") == "Y"
+                   else "<td class='flag-warn'>boilerplate / none</td>")
+
+    branch = r.get("default_branch", "")
+    branch_html = html.escape(branch) if branch else "<span class='muted'>?</span>"
+    desc = r.get("description", "")
+    desc_html = (f"<div class='desc'>{html.escape(desc)}</div>" if desc
+                 else "<span class='muted'>(none)</span>")
+
+    return (
+        f"<tr><td class='platform'>{label}</td>"
+        f"<td class='mono'>{path}</td>"
+        f"<td{laravel_cell_cls}>{laravel_html}</td>"
+        f"<td class='mono'>{branch_html}</td>"
+        f"{prefix_cell}{readme_cell}"
+        f"<td>{desc_html}</td></tr>"
+    )
+
+
+def render_app_card(name: str, app_rows: list[dict]) -> tuple[str, bool, bool]:
+    """Return (card_html, has_problem, drift) for one app and its remotes."""
+    versions = {r.get("laravel") for r in app_rows
+                if r.get("reachable") == "Y" and r.get("laravel")}
+    drift = len(versions) > 1
+    has_problem = drift or any(
+        r.get("prefix_ok") == "N" or r.get("custom_readme") == "N"
+        or r.get("reachable") == "N" for r in app_rows
+    )
+    cls = "app drift" if drift else "app flagged" if has_problem else "app"
+
+    badges = ""
+    if drift:
+        joined = html.escape(" vs ".join(sorted(v for v in versions if v)))
+        badges = f"<span class='badge bad'>version drift: {joined}</span>"
+    header = f"<header><h2>{html.escape(name)}</h2>{badges}</header>"
+
+    # Defensive: an app with no recognised remotes (shouldn't normally happen,
+    # since discovery requires a GitLab remote in the first place).
+    if all("platform" not in r for r in app_rows):
+        msg = html.escape(app_rows[0].get("error") or "no GitLab/GitHub remotes recognised")
+        card = (f"<section class='{cls}' id='app-{_slug(name)}'>{header}"
+                f"<p class='muted' style='padding:12px 16px'>{msg}</p></section>")
+        return card, has_problem, drift
+
+    body_rows = "".join(render_remote_row(r, drift) for r in app_rows)
+    table = (
+        "<table><thead><tr>"
+        "<th>Platform</th><th>Path</th><th>Laravel</th><th>Branch</th>"
+        "<th>Prefix</th><th>README</th><th>Description</th>"
+        "</tr></thead><tbody>" + body_rows + "</tbody></table>"
+    )
+    return (f"<section class='{cls}' id='app-{_slug(name)}'>{header}{table}</section>",
+            has_problem, drift)
+
+
+def emit_report_html(rows: list[dict], root: object, style: str) -> None:
+    """Render the `report` rows as a grouped, self-contained HTML page."""
+    order: list[str] = []
+    grouped: dict[str, list[dict]] = {}
+    for r in rows:
+        d = r.get("directory", "")
+        if d not in grouped:
+            grouped[d] = []
+            order.append(d)
+        grouped[d].append(r)
+
+    cards: list[str] = []
+    flagged: list[str] = []
+    for d in order:
+        card, has_problem, _ = render_app_card(d, grouped[d])
+        cards.append(card)
+        if has_problem:
+            flagged.append(d)
+
+    n_prefix = sum(1 for r in rows if r.get("prefix_ok") == "N")
+    n_readme = sum(1 for r in rows if r.get("custom_readme") == "N")
+    n_unreach = sum(1 for r in rows if r.get("reachable") == "N")
+
+    stats = "".join([
+        _stat(len(order), "apps"),
+        _stat(n_prefix, "prefix mismatches", tone="warn" if n_prefix else "ok"),
+        _stat(n_readme, "boilerplate / missing READMEs", tone="warn" if n_readme else "ok"),
+        _stat(n_unreach, "unreachable remotes", tone="bad" if n_unreach else "ok"),
+    ])
+    if flagged:
+        links = " ".join(f"<a href='#app-{_slug(a)}'>{html.escape(a)}</a>" for a in flagged)
+        problem_line = f"<p class='problem-list'><strong>Needs attention:</strong> {links}</p>"
+    else:
+        problem_line = "<p class='problem-list'>✓ Everything looks tidy.</p>"
+
+    summary = f"<div class='summary'>{stats}</div>{problem_line}"
+    print(render_html_page(
+        title="repo-chores — drift report",
+        heading="repo-chores — drift report",
+        lead=f"{len(order)} production Laravel app(s) under {root}",
+        summary=summary, body="".join(cards), style=style,
+    ))
+
+
+def emit_readmecheck_html(flagged: list[dict], style: str) -> None:
+    if flagged:
+        rows = "".join(
+            f"<tr><td class='platform'>{_remote_label(r['platform'])}</td>"
+            f"<td class='mono'>{html.escape(r['path'])}</td>"
+            f"<td class='mono muted'>{html.escape(r['directory'])}</td></tr>"
+            for r in flagged
+        )
+        body = (
+            "<section class='app flagged'>"
+            "<header><h2>Boilerplate / missing READMEs</h2>"
+            f"<span class='badge warn'>{len(flagged)}</span></header>"
+            "<table><thead><tr><th>Platform</th><th>Path</th><th>Directory</th></tr></thead>"
+            f"<tbody>{rows}</tbody></table></section>"
+        )
+        summary = f"<div class='summary'>{_stat(len(flagged), 'repos need a README', tone='warn')}</div>"
+    else:
+        body = "<section class='app'><p style='padding:16px'>All reachable repos have a custom README. 🎉</p></section>"
+        summary = f"<div class='summary'>{_stat(0, 'repos need a README', tone='ok')}</div>"
+    print(render_html_page(
+        title="repo-chores — README check",
+        heading="repo-chores — README check",
+        lead="Repos still using the default / boilerplate README (or none at all).",
+        summary=summary, body=body, style=style,
+    ))
+
+
+def emit_update_html(changes: list[dict], apply: bool, style: str) -> None:
+    mode = "Applied changes" if apply else "Dry-run — no writes"
+    if not changes:
+        body = "<section class='app'><p style='padding:16px'>Every reachable repo description already carries the right prefix. 🎉</p></section>"
+        summary = f"<div class='summary'>{_stat(0, 'changes', tone='ok')}</div>"
+    else:
+        out_rows = []
+        for r in changes:
+            result = r.get("result", "")
+            res_cls = " class='flag-bad'" if apply and not result.startswith("updated") else ""
+            out_rows.append(
+                f"<tr><td class='platform'>{_remote_label(r['platform'])}</td>"
+                f"<td class='mono'>{html.escape(r['path'])}</td>"
+                f"<td class='desc'>{html.escape(r.get('from') or '(none)')}</td>"
+                f"<td class='desc'>{html.escape(r.get('to', ''))}</td>"
+                f"<td{res_cls}>{html.escape(result)}</td></tr>"
+            )
+        body = (
+            "<section class='app'>"
+            f"<header><h2>Description changes</h2><span class='badge warn'>{html.escape(mode)}</span></header>"
+            "<table><thead><tr><th>Platform</th><th>Path</th><th>From</th><th>To</th><th>Result</th></tr></thead>"
+            f"<tbody>{''.join(out_rows)}</tbody></table></section>"
+        )
+        summary = (f"<div class='summary'>{_stat(len(changes), 'changes')}"
+                   f"<span class='stat'><b>{html.escape(mode)}</b></span></div>")
+    print(render_html_page(
+        title="repo-chores — descriptions",
+        heading="repo-chores — description updates",
+        lead=f"{mode}.",
+        summary=summary, body=body, style=style,
+    ))
+
+
 # --- subcommands --------------------------------------------------------------
 
 def cmd_report(apps: list[App], args: argparse.Namespace) -> None:
@@ -415,8 +743,10 @@ def cmd_report(apps: list[App], args: argparse.Namespace) -> None:
                 rows.extend(report_row(app, info) for info in infos)
         if args.format == "csv":
             emit_csv(REPORT_FIELDS, rows)
-        else:
+        elif args.format == "json":
             emit_json(rows)
+        else:  # html
+            emit_report_html(rows, args.path, load_html_style(args))
         return
 
     print(f"Found {len(apps)} production Laravel app(s) under {args.path}\n")
@@ -458,6 +788,9 @@ def cmd_readme_check(apps: list[App], args: argparse.Namespace) -> None:
     if args.format == "json":
         emit_json(flagged)
         return
+    if args.format == "html":
+        emit_readmecheck_html(flagged, load_html_style(args))
+        return
 
     if not flagged:
         print("All reachable repos have a custom README. 🎉")
@@ -494,6 +827,9 @@ def cmd_update_descriptions(apps: list[App], args: argparse.Namespace) -> None:
     if args.format == "json":
         emit_json(changes)
         return
+    if args.format == "html":
+        emit_update_html(changes, args.apply, load_html_style(args))
+        return
 
     if not changes:
         print("Every reachable repo description already carries the right prefix. 🎉")
@@ -518,8 +854,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help=f"Code folder to scan (default: {DEFAULT_ROOT})")
     common.add_argument("--only",
                         help="Only process apps whose directory name contains this substring.")
-    common.add_argument("--format", choices=["text", "csv", "json"], default="text",
-                        help="Output format (default: text).")
+    common.add_argument("--format", choices=["text", "csv", "json", "html"], default="text",
+                        help="Output format (default: text). 'html' is a self-contained page.")
+    common.add_argument("--css", type=Path, metavar="FILE",
+                        help="Custom CSS file for --format html (overrides the built-in UofG theme).")
 
     parser = argparse.ArgumentParser(
         description="Housekeeping chores for our production Laravel apps.")
