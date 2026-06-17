@@ -1,0 +1,12 @@
+# repo-chores configuration
+#
+# Copy this file to ".env" (which is git-ignored) and fill in your values,
+# or set these as real environment variables instead. Real environment
+# variables take precedence over anything in .env.
+
+# REQUIRED: your on-prem GitLab host — just the hostname, no https:// prefix.
+REPO_CHORES_GITLAB_HOST=gitlab.example.com
+
+# OPTIONAL: the folder scanned for Laravel apps.
+# Defaults to ~/Documents/code if unset. Can also be overridden with --path.
+# REPO_CHORES_CODE_DIR=/path/to/your/code
